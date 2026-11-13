@@ -1,0 +1,5 @@
+# dsh-desktop-embed：把桌面版 DSH 嵌进 DSHA 的 WebView（手机侧插件）。
+# 配置走 $DSH_HOME/dsh-embed.json、环境变量，或安装后打开的 /embed/setup。
+- insert:
+    - id: dsh-desktop-embed
+      name: 'dsh-desktop-embed'

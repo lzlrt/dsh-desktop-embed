@@ -1,0 +1,60 @@
+{
+  "name": "dsh-desktop-embed",
+  "version": "1.0.0",
+  "description": "Embed the desktop DSH UI inside DSHA's WebView instead of handing it to the system browser: a loopback reverse proxy on the phone plus an iframe shell page.",
+  "type": "module",
+  "license": "MIT",
+  "author": "lzlrt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lzlrt/dsh-desktop-embed.git"
+  },
+  "homepage": "https://github.com/lzlrt/dsh-desktop-embed#readme",
+  "bugs": {
+    "url": "https://github.com/lzlrt/dsh-desktop-embed/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsha",
+    "embed",
+    "iframe",
+    "proxy",
+    "dsh-desktop-link"
+  ],
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.1-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "load": "./client.js"
+    }
+  },
+  "peerDependencies": {},
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  }
+}
