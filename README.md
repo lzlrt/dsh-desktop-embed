@@ -96,6 +96,30 @@ curl http://127.0.0.1:<手机 DSH 端口>/api/dsh-embed/status
 
 返回里的 `cache.entries` / `cache.bytes` / `warm`（资产数、成功数、耗时）就是预热结果；`warm.ok=false` 时看 `warm.error`。
 
+## 1.2.0 修了什么（「Failed to load plugins」那次）
+
+手机上报 `Failed to load plugins`、进度卡在 23%、底下列出二十几个 `@deepseek-ai/dsh-client-*`，看着像插件集体坏了，其实是两件事叠在一起：
+
+**一、中继在配对失效时回的是 200，不是 401。**
+会话过期后（桌面 `dsh web` 重启、重新配对都会触发），中继对**任何**路径都回一个 2056 字节的 `text/html` 页面「Pairing link invalid / 配对已失效」。浏览器把它当 `application/javascript` 去解析，每个插件的 chunk 都语法错误 —— 于是整片插件加载失败。1.2.0 在代理层识别这个页面（`looksLikeInvalidPair`，只对小于 8 KB 的 HTML 做判断，不会误伤 60 KB 的真页面），一旦命中就丢掉 cookie、重铸一次、**把同一个请求重发**，并清掉入口缓存；重铸还失败才回 503 页并给一个「重新配对」链接（`/embed/remint`）。
+
+**二、`/plugins/??a,b,c` 这种合并请求被缓存键串了味。**
+这种请求的 `pathname` 只有 `/plugins/`，真正的区别在查询串。1.1.0 的缓存键漏了查询串，于是「先取到的那一组插件」会被当成所有组的答案发给后续请求 —— 同样是整片失败。1.2.0 把 `search` 并进键里。
+
+顺手还修了两个只有代理自己知道的问题：
+
+| 问题 | 症状 | 修法 |
+|---|---|---|
+| 上游的 `transfer-encoding: chunked` 被原样转给下游，同时我们又写了 `content-length` | 客户端报 `HPE_INVALID_CONTENT_LENGTH: Content-Length can't be present with Transfer-Encoding` | `downstreamHeaders` 也过滤 `HOP_BY_HOP` |
+| 判断「是不是失效页」用的 16 KB 缓冲上限，顺手把 61 KB 的入口页也判成「太大不缓冲」 | 入口页不再注入样式、不进缓存、每次都要重新取 | HTML 单独给 `MAX_HTML_BYTES = 2 MB`，只有超过 2 MB 才透传不注入 |
+
+回归测试（不碰真实桌面，假中继 + 假 bridge）：
+
+```bash
+node dsha-pair/test_embed_units.mjs       # 23 项：失效页识别 / 路径改写 / 缓存键 / 资源提取
+node dsha-pair/test_embed_recovery.mjs    # 17 项：失效自愈 + 缓存命中 + 合并请求键隔离
+```
+
 ## 手机上的排版
 
 iframe 与外层不同源（端口不同），外层改不了里面的 DOM，所以排版修补放在代理这一层：给经过的入口页注入一张样式表，规则全部关在 `@media (max-width: 1023px) and (pointer: coarse)` 里——
@@ -110,7 +134,7 @@ iframe 与外层不同源（端口不同），外层改不了里面的 DOM，所
 ## 已知限制
 
 1. **`Secure` cookie 不能用明文 http 送过去。** 中继的 `dsh_pair` 带 `Secure`；手机 → 中继这一段如果是 `https://`（中继本身就是 https，正常情况都满足），代理拿着 cookie 发请求没问题。但如果你的 `bridgeUrl` 指向一个 http 桥，插件只是拿它当「取链接的信使」，不拿它传 cookie，所以照样可用。
-2. **中继掉线要重新配对。** 令牌 600 秒过期、会话 cookie 一年；代理在收到上游 401 时会**自动重铸一次再重试**，所以一般无感。若中继换域名（`*.trycloudflare.com` 就是这样），要在 `/embed/setup` 里改 `bridgeUrl`。
+2. **中继掉线要重新配对。** 令牌 600 秒过期，会话 cookie 名义上一年，但**服务端会话会单独失效**（桌面 `dsh web` 重启、重新配对之后就会失效，且失效时中继回 200 的 HTML 而不是 401）。1.2.0 起代理两种情形都能识别并**自动重铸一次再重试**，所以正常无感；实在不行点 `/embed/remint`。若中继换域名（`*.trycloudflare.com` 就是这样），要在 `/embed/setup` 里改 `bridgeUrl`。
 3. **`/embed` 不接管键盘快捷键**：DSHA 的返回手势会直接退出这个页面（顶层导航回对话列表），这是 WebView 的正常行为。
 4. **只支持 `http://127.0.0.1`**：DSHA 的预览策略只认回环明文。别把代理绑到 `0.0.0.0`，也没必要。
 5. **中继不转发的部分插件静态资源会 403**：中继只放行 `/api`、`/assets`、`/plugins/??…` 目录批量加载和 `/pair-app`；个别插件用绝对路径挂的自己的静态文件（实测 `dsh-whale/widget.js`、`dsh-pet/pet.js`、`/plugins/<插件>/state`）会 403。它们都是可选挂件，界面照常可用，控制台里会留几条 403。

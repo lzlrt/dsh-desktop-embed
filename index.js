@@ -54,6 +54,7 @@ const NS = 'dsh-embed'
 const EMBED_PATH = '/embed'
 const SETUP_PATH = '/embed/setup'
 const STATUS_PATH = '/api/dsh-embed/status'
+const REMINT_PATH = '/embed/remint'
 const DEFAULT_PROXY_PORT = 8799
 const CONFIG_FILE_NAME = 'dsh-embed.json'
 /** cookie 由 `/embed` 下发、由代理校验；都绑在 127.0.0.1 上（cookie 不区分端口）。 */
@@ -69,6 +70,10 @@ const httpAgent = new HttpAgent({ keepAlive: true, keepAliveMsecs: 20000, maxSoc
 const httpsAgent = new HttpsAgent({ keepAlive: true, keepAliveMsecs: 20000, maxSockets: 16 })
 
 /** 静态资源（带内容哈希的文件名）可以长期缓存；入口页 5 分钟内有效。 */
+// 入口页有 61 KB（远大于探测失效页所需的 8 KB），但我们要拿到全文才能注入与缓存，
+// 所以 HTML 单独给一个大上限；超过它就不注入、直接透传。
+const MAX_HTML_BYTES = 2 * 1024 * 1024
+
 const MAX_CACHE_ENTRY = 4 * 1024 * 1024
 const MAX_CACHE_BYTES = 96 * 1024 * 1024
 const ENTRY_TTL_MS = 5 * 60 * 1000
@@ -190,6 +195,7 @@ function createState() {
     inflight: new Map(),
     warming: null,
     warm: null,
+    pairFailures: 0,
   }
 }
 
@@ -354,8 +360,13 @@ function prewarm(state, cfg) {
     const report = { ok: false, assets: 0, fetched: 0, bytes: 0, ms: 0, at: Date.now(), error: '' }
     try {
       await ensureSession(state, cfg)
-      const entry = await fetchThrough(state, ENTRY_PATH)
+      let entry = await fetchThrough(state, ENTRY_PATH)
+      if (entry.status !== 200 || looksLikeInvalidPair(entry.body)) {
+        await ensureSession(state, cfg)
+        entry = await fetchThrough(state, ENTRY_PATH)
+      }
       if (entry.status !== 200) throw new Error(`入口页 HTTP ${entry.status}`)
+      if (looksLikeInvalidPair(entry.body)) throw new Error('配对已失效（重铸后中继仍然不认）')
       cacheSet(state, ENTRY_PATH, 'text/html; charset=utf-8', entry.body)
       report.bytes += entry.body.length
       const list = extractAssets(entry.body.toString('utf8')).slice(0, 32)
@@ -441,6 +452,9 @@ function downstreamHeaders(incoming, upstreamOrigin) {
   for (const [name, value] of Object.entries(incoming)) {
     const key = name.toLowerCase()
     if (STRIPPED_RESPONSE.has(key)) continue
+    // 上游的 transfer-encoding 必须丢掉：我们多半会自己写 content-length，
+    // 两个并存会让客户端直接报 HPE_INVALID_CONTENT_LENGTH（见 1.2.0）。
+    if (HOP_BY_HOP.has(key)) continue
     if (value === undefined) continue
     headers[key] = value
   }
@@ -486,14 +500,20 @@ function upstreamPath(rawUrl) {
 function cacheableKey(req) {
   if (req.method !== 'GET' && req.method !== 'HEAD') return ''
   let pathname = '/'
+  let search = ''
   try {
-    pathname = new URL(req.url || '/', 'http://placeholder.invalid').pathname || '/'
+    const parsed = new URL(req.url || '/', 'http://placeholder.invalid')
+    pathname = parsed.pathname || '/'
+    search = parsed.search || ''
   } catch {
     return ''
   }
   if (pathname === '/') return ENTRY_PATH
   if (pathname.startsWith('/assets/')) return pathname
-  if (pathname.startsWith('/plugins/')) return pathname
+  // `/plugins/??a,b,c` 是「一次取多个插件」的合并请求：pathname 只有 `/plugins/`，
+  // 真正区分它们的是查询串。漏掉它会让不同组合共用一个缓存键，
+  // 表现就是插件批量加载失败——必须带上 search。
+  if (pathname.startsWith('/plugins/')) return `${pathname}${search}`
   return ''
 }
 
@@ -550,6 +570,46 @@ function injectIntoHtml(html) {
   let out = html.includes('</head>') ? html.replace('</head>', `${style}</head>`) : style + html
   out = out.includes('</body>') ? out.replace('</body>', `${PROGRESS_SCRIPT}</body>`) : out + PROGRESS_SCRIPT
   return out
+}
+
+/** 中继配对失效时的页面文案（size 很小、200 OK、text/html）。 */
+const INVALID_PAIR_MARKERS = ['pairing link invalid', '配对已失效', '配对链接已过期']
+
+function looksLikeInvalidPair(body) {
+  if (!body || body.length > 8192) return false
+  const text = body.toString('utf8').toLowerCase()
+  return INVALID_PAIR_MARKERS.some((marker) => text.includes(marker))
+}
+
+function cacheDrop(state, key) {
+  const hit = state.cache.get(key)
+  if (!hit) return
+  state.cache.delete(key)
+  state.cacheBytes = Math.max(0, state.cacheBytes - hit.body.length)
+}
+
+/**
+ * 缓冲到上限为止：用来判断一个 HTML 响应到底是真页面还是「配对已失效」。
+ * 超过上限就交给调用方直通（暂停流，数据留在内部队列里，不会被丢掉）。
+ */
+function bufferSmall(stream, limit = 16384) {
+  return new Promise((resolvePromise) => {
+    const chunks = []
+    let size = 0
+    let overflowed = false
+    stream.on('data', (chunk) => {
+      if (overflowed) return
+      chunks.push(chunk)
+      size += chunk.length
+      if (size > limit) {
+        overflowed = true
+        stream.pause()
+        resolvePromise({ overflowed, chunks, body: Buffer.concat(chunks) })
+      }
+    })
+    stream.on('end', () => resolvePromise({ overflowed, chunks, body: Buffer.concat(chunks) }))
+    stream.on('error', () => resolvePromise({ overflowed, chunks, body: Buffer.concat(chunks), error: true }))
+  })
 }
 
 /**
@@ -622,23 +682,55 @@ function proxyOnce(state, clientReq, clientRes, retried = false) {
       up.on('error', clear)
     })
   }
-  upstream.on('response', (up) => {
-    if (up.statusCode === 401 && !retried && state.canRemint) {
+  upstream.on('response', async (up) => {
+    const status = up.statusCode ?? 502
+    if (status === 401 && !retried && state.canRemint) {
       up.resume()
-      return state
-        .remint()
-        .then(() => proxyOnce(state, clientReq, clientRes, true))
-        .catch((error) => proxyOnce(state, clientReq, clientRes, true) ?? sendHtml(clientRes, 502, page('上游失败', `<p>${escapeHtml(error?.message)}</p>`)))
+      try {
+        await state.remint()
+      } catch (error) {
+        state.lastError = error?.message ?? String(error)
+      }
+      return proxyOnce(state, clientReq, clientRes, true)
     }
     const type = String(up.headers['content-type'] || '')
-    const status = up.statusCode ?? 502
 
-    // 入口页：缓冲下来做两件事——写进缓存、注入手机排版与进度脚本
-    if (status === 200 && type.includes('text/html') && (cacheKey === ENTRY_PATH || wanted === ENTRY_PATH)) {
-      const chunks = []
-      up.on('data', (chunk) => chunks.push(chunk))
-      up.on('end', () => {
-        const raw = Buffer.concat(chunks)
+    // HTML：先缓冲看它是不是「配对已失效」。中继失效时回 200 而不是 401，
+    // 这页要是被当成 JS 交给客户端，表现就是整片插件加载失败。
+    if (status === 200 && type.includes('text/html')) {
+      const buffered = await bufferSmall(up, MAX_HTML_BYTES)
+      if (!buffered.overflowed && looksLikeInvalidPair(buffered.body)) {
+        up.resume()
+        state.cookie = ''
+        cacheDrop(state, ENTRY_PATH)
+        state.pairFailures = (state.pairFailures ?? 0) + 1
+        if (!retried && state.canRemint) {
+          try {
+            await state.remint()
+          } catch (error) {
+            state.lastError = error?.message ?? String(error)
+          }
+          return proxyOnce(state, clientReq, clientRes, true)
+        }
+        return sendHtml(
+          clientRes,
+          503,
+          page(
+            '配对已失效',
+            '<p>这台电脑上的配对已经失效（中继不认原来那枚 cookie 了）。重新配对一次就能恢复。</p>'
+              + '<p><a href="/embed/remint">重新配对</a></p>',
+          ),
+        )
+      }
+      if (buffered.overflowed) {
+        const headers = downstreamHeaders(up.headers, state.relay)
+        clientRes.writeHead(status, headers)
+        clientRes.write(Buffer.concat(buffered.chunks))
+        up.pipe(clientRes)
+        return
+      }
+      const raw = buffered.body
+      if (cacheKey === ENTRY_PATH || wanted === ENTRY_PATH) {
         cacheSet(state, ENTRY_PATH, 'text/html; charset=utf-8', raw)
         const body = Buffer.from(injectIntoHtml(raw.toString('utf8')))
         const headers = downstreamHeaders(up.headers, state.relay)
@@ -648,16 +740,17 @@ function proxyOnce(state, clientReq, clientRes, retried = false) {
         headers['x-dsh-embed-injected'] = 'mobile'
         clientRes.writeHead(200, headers)
         clientRes.end(body)
-      })
-      up.on('error', () => {
-        if (!clientRes.headersSent) sendHtml(clientRes, 502, page('上游失败', '<p>入口页读取中断。</p>'))
-        else clientRes.destroy()
-      })
+        return
+      }
+      const headers = downstreamHeaders(up.headers, state.relay)
+      headers['content-length'] = String(raw.length)
+      clientRes.writeHead(status, headers)
+      clientRes.end(raw)
       return
     }
 
     // 静态资源：边转发边存，超过上限就放弃缓存但照常转发
-    if (status === 200 && cacheKey && !type.includes('text/html')) {
+    if (status === 200 && cacheKey) {
       const chunks = []
       let size = 0
       let streaming = false
@@ -679,7 +772,8 @@ function proxyOnce(state, clientReq, clientRes, retried = false) {
           return
         }
         const body = Buffer.concat(chunks)
-        cacheSet(state, cacheKey, type || 'application/octet-stream', body)
+        // 失效页偶尔不带 text/html，这里再挡一次，别把错误页存成资源
+        if (!looksLikeInvalidPair(body)) cacheSet(state, cacheKey, type || 'application/octet-stream', body)
         const headers = downstreamHeaders(up.headers, state.relay)
         headers['content-length'] = String(body.length)
         headers['cache-control'] = 'public, max-age=31536000, immutable'
@@ -1004,6 +1098,27 @@ async function apply(ctx, rawConfig) {
     },
   })
 
+  const remintRoute = ctx.webServer.register({
+    kind: 'exact',
+    path: REMINT_PATH,
+    handler: async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        res.writeHead(405, { allow: 'GET, POST' })
+        return res.end()
+      }
+      cacheDrop(state, ENTRY_PATH)
+      state.cookie = ''
+      try {
+        await state.remint()
+      } catch (error) {
+        state.lastError = error?.message ?? String(error)
+      }
+      void prewarm(state, cfgOf())
+      res.writeHead(303, { location: EMBED_PATH, 'cache-control': 'no-store' })
+      res.end()
+    },
+  })
+
   const statusRoute = ctx.webServer.register({
     kind: 'exact',
     path: STATUS_PATH,
@@ -1029,6 +1144,7 @@ async function apply(ctx, rawConfig) {
           budget: MAX_CACHE_BYTES,
         },
         warm: state.warm,
+        pairFailures: state.pairFailures,
       })
     },
   })
@@ -1037,6 +1153,7 @@ async function apply(ctx, rawConfig) {
     embedRoute?.()
     setupRoute?.()
     statusRoute?.()
+    remintRoute?.()
     try {
       state.server?.close()
     } catch {}
@@ -1046,4 +1163,5 @@ async function apply(ctx, rawConfig) {
 export const name = NS
 export const inject = ['webServer']
 export { apply }
+export const __test = { upstreamPath, cacheableKey, looksLikeInvalidPair, extractAssets, bufferSmall }
 export { configSchema as Config }

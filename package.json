@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-embed",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Embed the desktop DSH UI inside DSHA's WebView instead of handing it to the system browser: a loopback reverse proxy on the phone plus an iframe shell page.",
   "type": "module",
   "license": "MIT",
