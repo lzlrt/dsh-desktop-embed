@@ -10,14 +10,14 @@ window.__ModuleLoader__.load({
     const EMBED_PATH = '/embed'
 
     const zh = {
-      'action': '桌面版（嵌在这里）',
-      'action.short': '桌面版',
+      'action': '桌面版 · 嵌在这里',
+      'action.short': '内嵌',
       'hint': '在 DSHA 里打开电脑版界面，不跳浏览器',
       'crash.fallback': '内嵌按钮出错了，界面其余部分不受影响。也可以直接在地址栏打开 /embed。',
     }
     const en = {
-      'action': 'Desktop DSH (embedded)',
-      'action.short': 'Desktop',
+      'action': 'Desktop · embedded',
+      'action.short': 'Embedded',
       'hint': 'Open the desktop UI inside DSHA, not in the browser',
       'crash.fallback': 'The embed button failed; the rest of the UI is fine. You can also open /embed directly.',
     }

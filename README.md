@@ -153,3 +153,9 @@ iframe 与外层不同源（端口不同），外层改不了里面的 DOM，所
 ## License
 
 MIT © 2026 lzlrt
+
+## 和另一个「桌面版」插件的关系
+
+侧栏文案区分两者：**桌面版 · 新窗口**（本插件，交给系统浏览器）对 **桌面版 · 嵌在这里**（`dsh-desktop-embed`，留在 DSHA 里 iframe 内嵌）。
+
+两者状态互不共享，装哪个都行，也可以同时装；两份都装的代价只是侧栏多一个按钮。完整对照表见 [REMOTE-PLUGINS.md](https://github.com/lzlrt/dsha-desktop-link/blob/main/REMOTE-PLUGINS.md)（另一份同内容文档在本地 `Z:\dsh\dsha-pair\REMOTE-PLUGINS.md`）。
